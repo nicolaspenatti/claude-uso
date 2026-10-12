@@ -5,6 +5,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -15,6 +16,8 @@ using Microsoft.Win32;
 
 class Sessao { public string Projeto, Chave; public long H5, D7; public DateTime Ultimo; public bool Nomeado; }
 class Uso { public long H5, D7; public List<Sessao> Sessoes = new List<Sessao>(); }
+class JanelaUso { public double Pct; public DateTime? Reinicia; } // Reinicia em UTC; null = sem janela ativa
+class UsoOficial { public JanelaUso H5, D7; public DateTime Quando; }
 
 class Painel : Form
 {
@@ -50,6 +53,7 @@ class Painel : Form
         {
             if (!novo) return;
             SetProcessDPIAware();
+            try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; } catch { }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             var p = new Painel();
@@ -78,8 +82,11 @@ class Painel : Form
         LerLimites();
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Atualizar agora", null, (s, e) => Atualizar());
-        menu.Items.Add("Limites…", null, (s, e) => EditarLimites());
+        itemStatus = new ToolStripMenuItem("Consultando o uso oficial…") { Enabled = false };
+        menu.Items.Add(itemStatus);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Atualizar agora", null, (s, e) => { Atualizar(); AtualizarOficial(5); });
+        menu.Items.Add("Limites da estimativa…", null, (s, e) => EditarLimites());
         var intv = new ToolStripMenuItem("Verificação periódica");
         int atualSeg = IntervaloSeg();
         foreach (int seg in new[] { 60, 120, 300 })
@@ -116,13 +123,16 @@ class Painel : Form
 
         // fallback lento: a janela de 5h e a sessão "ativa" mudam com o tempo, sem evento de arquivo
         timer = new System.Windows.Forms.Timer { Interval = IntervaloSeg() * 1000 };
-        timer.Tick += (s, e) => { if (watcher == null) IniciarWatcher(); Atualizar(); };
+        timer.Tick += (s, e) => { if (watcher == null) IniciarWatcher(); Atualizar(); AtualizarOficial(BuscaMinSeg); };
         timer.Start();
 
         debounce = new System.Windows.Forms.Timer { Interval = 1500 };
-        debounce.Tick += (s, e) => { debounce.Stop(); Atualizar(); };
+        debounce.Tick += (s, e) => { debounce.Stop(); Atualizar(); AtualizarOficial(BuscaMinSeg); };
+        buscaTimer = new System.Windows.Forms.Timer();
+        buscaTimer.Tick += (s, e) => { buscaTimer.Stop(); AtualizarOficial(BuscaMinSeg); };
         IniciarWatcher();
         Atualizar();
+        AtualizarOficial(0);
     }
 
     static int IntervaloSeg() { return (int)Math.Max(60, LerNum("Intervalo", 120)); }
@@ -176,6 +186,7 @@ class Painel : Form
     {
         timer.Stop();
         debounce.Stop();
+        buscaTimer.Stop();
         if (watcher != null) { watcher.EnableRaisingEvents = false; watcher.Dispose(); watcher = null; }
         tray.Visible = false;
         tray.Dispose();
@@ -214,6 +225,7 @@ class Painel : Form
     {
         Reposicionar();
         Atualizar();
+        AtualizarOficial(15);
         Show();
         Activate();
     }
@@ -287,7 +299,7 @@ class Painel : Form
 
             int pad = px(22), larg = px(330) - 2 * pad;
             var tit = new Label { Text = "Limites de uso", Font = new Font("Segoe UI Semibold", 11f), AutoSize = true, Location = new Point(pad, px(18)), ForeColor = Texto };
-            var dica = new Label { Text = "Em milhões de tokens. Ajuste conforme o seu plano.", AutoSize = true, Location = new Point(pad, px(44)), ForeColor = TextoSuave, Font = new Font("Segoe UI", 8.5f) };
+            var dica = new Label { Text = "Em milhões de tokens. Só vale sem os dados oficiais.", AutoSize = true, Location = new Point(pad, px(44)), ForeColor = TextoSuave, Font = new Font("Segoe UI", 8.5f) };
 
             Func<string, int, long, TextBox> campo = (rotulo, y, valor) =>
             {
@@ -348,12 +360,10 @@ class Painel : Form
         cacheArq.Clear(); registros.Clear(); vistos.Clear(); nomes.Clear();
     }
 
-    Uso Calcular()
+    Uso Calcular(DateTime corte5)
     {
         var r = new Uso();
-        var agora = DateTime.UtcNow;
-        var corte7 = agora.AddDays(-7);
-        var corte5 = agora.AddHours(-5);
+        var corte7 = DateTime.UtcNow.AddDays(-7);
         string raiz = PastaProjetos();
         if (!Directory.Exists(raiz)) { ZerarCache(); return r; }
 
@@ -376,7 +386,7 @@ class Painel : Form
                 }
                 DateTime u;
                 if (!ultimos.TryGetValue(c.Chave, out u) || escrito > u) ultimos[c.Chave] = escrito;
-                if (!LerNovo(arq, c, corte7)) { ZerarCache(); return Calcular(); } // arquivo truncado: recomeça do zero
+                if (!LerNovo(arq, c, corte7)) { ZerarCache(); return Calcular(corte5); } // arquivo truncado: recomeça do zero
             }
             catch { }
         }
@@ -484,7 +494,8 @@ class Painel : Form
     {
         if (calculando) { pendente = true; return; }
         calculando = true;
-        Task.Run(() => Calcular()).ContinueWith(t =>
+        var corte5 = CorteH5();
+        Task.Run(() => Calcular(corte5)).ContinueWith(t =>
         {
             calculando = false;
             if (IsDisposed) return;
@@ -497,6 +508,209 @@ class Painel : Form
             }
             if (pendente) { pendente = false; Atualizar(); }
         }, TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    // ---- Uso oficial: o mesmo endpoint que o Claude Code consulta para mostrar os limites do plano ----
+    const string UrlUso = "https://api.anthropic.com/api/oauth/usage";
+    const int BuscaMinSeg = 60;  // intervalo mínimo entre consultas automáticas
+    const int ValidadeMin = 15;  // sem consulta bem-sucedida por esse tempo, volta para a estimativa
+
+    class Resultado { public UsoOficial Dados; public string Erro; public int EsperarSeg; }
+
+    UsoOficial dadosOficiais;
+    bool buscando;
+    DateTime ultimaBusca = DateTime.MinValue, bloqueadoAte = DateTime.MinValue;
+    System.Windows.Forms.Timer buscaTimer; // consulta adiada até o fim do intervalo mínimo
+    ToolStripMenuItem itemStatus;
+
+    void AtualizarOficial(int idadeMinSeg)
+    {
+        if (buscando) return;
+        var agora = DateTime.UtcNow;
+        double espera = Math.Max((ultimaBusca.AddSeconds(idadeMinSeg) - agora).TotalSeconds, (bloqueadoAte - agora).TotalSeconds);
+        if (espera > 0)
+        {
+            // adia para o fim do intervalo, para o valor não ficar defasado quando a atividade parar
+            if (!buscaTimer.Enabled) { buscaTimer.Interval = (int)Math.Min(3600000, Math.Max(1000, espera * 1000)); buscaTimer.Start(); }
+            return;
+        }
+        buscaTimer.Stop();
+        buscando = true;
+        ultimaBusca = agora;
+        Task.Run(() => Consultar()).ContinueWith(t =>
+        {
+            buscando = false;
+            if (IsDisposed) return;
+            var r = t.IsFaulted ? new Resultado { Erro = "falha na consulta" } : t.Result;
+            if (r.Dados != null)
+            {
+                dadosOficiais = r.Dados;
+                itemStatus.Text = "Uso oficial · atualizado " + r.Dados.Quando.ToLocalTime().ToString("HH:mm");
+            }
+            else
+            {
+                if (r.EsperarSeg > 0) bloqueadoAte = DateTime.UtcNow.AddSeconds(r.EsperarSeg);
+                var f = Fresco(); // o último valor oficial ainda vale por alguns minutos
+                itemStatus.Text = f != null
+                    ? "Uso oficial · último às " + f.Quando.ToLocalTime().ToString("HH:mm") + " (" + r.Erro + ")"
+                    : "Estimativa local · " + r.Erro;
+            }
+            Atualizar(); // realinha a janela de 5h das sessões e repinta
+            Invalidate();
+            AtualizarIconeTray();
+        }, TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    // só leitura: o app nunca renova nem grava o login; quem renova é o Claude Code
+    static string LerToken(out string erro)
+    {
+        erro = "sem login do Claude Code";
+        try
+        {
+            string arq = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", ".credentials.json");
+            if (!File.Exists(arq)) return null;
+            string json;
+            using (var fs = new FileStream(arq, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var sr = new StreamReader(fs, Encoding.UTF8)) json = sr.ReadToEnd();
+            var raiz = new JavaScriptSerializer().DeserializeObject(json) as Dictionary<string, object>;
+            object o, tok, exp;
+            var oauth = raiz != null && raiz.TryGetValue("claudeAiOauth", out o) ? o as Dictionary<string, object> : null;
+            if (oauth == null || !oauth.TryGetValue("accessToken", out tok) || tok == null) return null;
+            if (oauth.TryGetValue("expiresAt", out exp) && exp != null)
+            {
+                var fim = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(Convert.ToInt64(exp, CultureInfo.InvariantCulture));
+                if (fim <= DateTime.UtcNow.AddSeconds(30)) { erro = "login expirado (use o Claude Code)"; return null; }
+            }
+            erro = null;
+            return tok.ToString();
+        }
+        catch { erro = "não foi possível ler o login"; return null; }
+    }
+
+    // roda em thread do pool; não mexe em estado da janela
+    static Resultado Consultar()
+    {
+        var r = new Resultado();
+        string erro;
+        string token = LerToken(out erro);
+        if (token == null) { r.Erro = erro; return r; }
+        try
+        {
+            var req = (HttpWebRequest)WebRequest.Create(UrlUso);
+            req.Timeout = req.ReadWriteTimeout = 10000;
+            req.KeepAlive = false;
+            req.UserAgent = "claude-uso-bandeja/1.0";
+            req.Accept = "application/json";
+            req.Headers["Authorization"] = "Bearer " + token;
+            req.Headers["anthropic-beta"] = "oauth-2025-04-20";
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                r.Dados = Interpretar(sr.ReadToEnd());
+            if (r.Dados == null) r.Erro = "resposta inesperada da API";
+        }
+        catch (WebException ex)
+        {
+            var resp = ex.Response as HttpWebResponse;
+            int cod = resp == null ? 0 : (int)resp.StatusCode;
+            if (resp == null) r.Erro = ex.Status == WebExceptionStatus.Timeout ? "tempo esgotado" : "sem conexão";
+            else if (cod == 401 || cod == 403) r.Erro = "login recusado (use o Claude Code)";
+            else if (cod == 429)
+            {
+                int seg;
+                if (!int.TryParse(resp.Headers["Retry-After"], out seg)) seg = 300;
+                r.EsperarSeg = Math.Max(60, Math.Min(3600, seg));
+                r.Erro = "muitas consultas, aguardando";
+            }
+            else r.Erro = "erro " + cod + " da API";
+            if (resp != null) resp.Close();
+        }
+        catch { r.Erro = "falha na consulta"; }
+        return r;
+    }
+
+    static UsoOficial Interpretar(string json)
+    {
+        try
+        {
+            var raiz = new JavaScriptSerializer().DeserializeObject(json) as Dictionary<string, object>;
+            if (raiz == null) return null;
+            var h5 = LerJanela(raiz, "five_hour");
+            var d7 = LerJanela(raiz, "seven_day");
+            if (h5 == null || d7 == null) return null;
+            return new UsoOficial { H5 = h5, D7 = d7, Quando = DateTime.UtcNow };
+        }
+        catch { return null; }
+    }
+
+    // campo ausente ou sem "utilization" = formato desconhecido (null); campo null = sem janela ativa (0%)
+    static JanelaUso LerJanela(Dictionary<string, object> raiz, string chave)
+    {
+        object v;
+        if (!raiz.TryGetValue(chave, out v)) return null;
+        var j = new JanelaUso();
+        var d = v as Dictionary<string, object>;
+        if (d == null) return v == null ? j : null;
+        object pct, fim;
+        if (!d.TryGetValue("utilization", out pct) || pct == null) return null;
+        j.Pct = Convert.ToDouble(pct, CultureInfo.InvariantCulture);
+        if (d.TryGetValue("resets_at", out fim) && fim != null)
+            j.Reinicia = DateTime.Parse(fim.ToString(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+        return j;
+    }
+
+    UsoOficial Fresco()
+    {
+        return dadosOficiais != null && (DateTime.UtcNow - dadosOficiais.Quando).TotalMinutes <= ValidadeMin ? dadosOficiais : null;
+    }
+
+    // janela já reiniciada = 0% até a próxima consulta
+    static double PctReal(JanelaUso j)
+    {
+        if (j.Reinicia != null && DateTime.UtcNow >= j.Reinicia.Value) return 0;
+        return Math.Max(0, Math.Min(100, j.Pct));
+    }
+
+    bool Pronto() { return carregado || Fresco() != null; }
+
+    int PctH5() { var o = Fresco(); return o != null ? (int)Math.Round(PctReal(o.H5)) : carregado ? Pct(uso.H5, lim5h) : 0; }
+    int PctD7() { var o = Fresco(); return o != null ? (int)Math.Round(PctReal(o.D7)) : carregado ? Pct(uso.D7, lim7d) : 0; }
+
+    // com dados oficiais, a janela de 5h começa 5 h antes do reinício; sem eles, é a deslizante
+    DateTime CorteH5()
+    {
+        var o = Fresco();
+        if (o != null && o.H5.Reinicia != null && o.H5.Reinicia.Value > DateTime.UtcNow) return o.H5.Reinicia.Value.AddHours(-5);
+        return DateTime.UtcNow.AddHours(-5);
+    }
+
+    // a API não separa por sessão: reparte a porcentagem oficial pelos tokens locais de cada uma
+    int PctSessao(long tokens)
+    {
+        var o = Fresco();
+        if (o == null) return Pct(tokens, lim5h);
+        return uso.H5 > 0 ? (int)Math.Min(100, Math.Round(PctReal(o.H5) * tokens / uso.H5)) : 0;
+    }
+
+    static readonly string[] Dias = { "dom.", "seg.", "ter.", "qua.", "qui.", "sex.", "sáb." };
+
+    // "em 4 h 40 min" (menos de 24 h) ou "qui., 18:00"; vazio sem janela ativa
+    static string Reinicio(DateTime? fimUtc)
+    {
+        if (fimUtc == null) return "";
+        var fim = fimUtc.Value.ToLocalTime();
+        fim = new DateTime((fim.Ticks + 30 * TimeSpan.TicksPerSecond) / TimeSpan.TicksPerMinute * TimeSpan.TicksPerMinute, fim.Kind); // minuto mais próximo
+        var falta = fim - DateTime.Now;
+        if (falta <= TimeSpan.Zero) return "";
+        if (falta.TotalHours >= 24) return Dias[(int)fim.DayOfWeek] + ", " + fim.ToString("HH:mm", CultureInfo.InvariantCulture);
+        int min = (int)Math.Ceiling(falta.TotalMinutes);
+        return min < 60 ? "em " + min + " min" : "em " + (min / 60) + " h " + (min % 60) + " min";
+    }
+
+    string Detalhe(JanelaUso j, long tokens, long lim)
+    {
+        if (j == null) return carregado ? Fmt(tokens) + " / " + Fmt(lim) : "";
+        string r = Reinicio(j.Reinicia);
+        return r.Length > 0 ? "reinicia " + r : "sem uso recente";
     }
 
     // ---- Opções salvas ----
@@ -581,42 +795,44 @@ class Painel : Form
         using (var fDet = new Font("Segoe UI", 8.5f))
         using (var fSessao = new Font("Segoe UI", 9.5f))
         {
+            var of = Fresco();
             // cabeçalho
             TextRenderer.DrawText(g, "Claude", fMarca, new Point(pad, pad - (int)(4 * s)), Texto, TextFormatFlags.NoPadding);
-            string hora = carregado ? atualizadoEm.ToString("HH:mm") : "";
+            string hora = Pronto() ? (of != null ? of.Quando.ToLocalTime() : atualizadoEm).ToString("HH:mm") : "";
             int wh = Larg(g, hora, fMini);
             TextRenderer.DrawText(g, hora, fMini, new Point(pad + largura - wh, pad - (int)(2 * s)), TextoSuave, TextFormatFlags.NoPadding);
 
+            var marcas = new List<string>();
+            if (porSessao) marcas.Add("por sessão");
+            if (of == null && carregado) marcas.Add("estimado");
+            if (marcas.Count > 0)
+                TextRenderer.DrawText(g, "· " + string.Join(" · ", marcas.ToArray()), fMini, new Point(pad + Larg(g, "Claude", fMarca) + (int)(6 * s), pad - (int)(2 * s)), TextoSuave, TextFormatFlags.NoPadding);
+
             int y = pad + (int)(26 * s);
             if (porSessao)
-            {
-                TextRenderer.DrawText(g, "· por sessão", fMini, new Point(pad + Larg(g, "Claude", fMarca) + (int)(6 * s), pad - (int)(2 * s)), TextoSuave, TextFormatFlags.NoPadding);
                 PintarSessoes(g, s, y, pad, largura, fMini, fSessao, fDet);
-            }
             else
             {
-                Bloco(g, s, "5 HORAS", carregado ? uso.H5 : 0, lim5h, y, pad, largura, fMini, fGrande, fSimbolo, fDet);
-                Bloco(g, s, "7 DIAS", carregado ? uso.D7 : 0, lim7d, y + (int)(82 * s), pad, largura, fMini, fGrande, fSimbolo, fDet);
+                Bloco(g, s, "5 HORAS", Pronto(), PctH5(), Detalhe(of != null ? of.H5 : null, uso.H5, lim5h), y, pad, largura, fMini, fGrande, fSimbolo, fDet);
+                Bloco(g, s, "7 DIAS", Pronto(), PctD7(), Detalhe(of != null ? of.D7 : null, uso.D7, lim7d), y + (int)(82 * s), pad, largura, fMini, fGrande, fSimbolo, fDet);
             }
         }
     }
 
-    void Bloco(Graphics g, float s, string rotulo, long v, long lim, int y, int pad, int largura, Font fMini, Font fGrande, Font fSimbolo, Font fDet)
+    void Bloco(Graphics g, float s, string rotulo, bool ok, int pct, string det, int y, int pad, int largura, Font fMini, Font fGrande, Font fSimbolo, Font fDet)
     {
-        int pct = Pct(v, lim);
         var cor = CorPct(pct);
 
         TextoEspacado(g, rotulo, fMini, pad, y, TextoSuave, 1.2f * s);
 
         // número grande + símbolo %
-        string num = carregado ? pct.ToString() : "–";
+        string num = ok ? pct.ToString() : "–";
         int wn = Larg(g, num, fGrande);
         int yn = y + (int)(10 * s);
         TextRenderer.DrawText(g, num, fGrande, new Point(pad - (int)(2 * s), yn), Texto, TextFormatFlags.NoPadding);
-        if (carregado) TextRenderer.DrawText(g, "%", fSimbolo, new Point(pad + wn, yn + (int)(14 * s)), TextoSuave, TextFormatFlags.NoPadding);
+        if (ok) TextRenderer.DrawText(g, "%", fSimbolo, new Point(pad + wn, yn + (int)(14 * s)), TextoSuave, TextFormatFlags.NoPadding);
 
         // detalhe à direita, alinhado à base do número
-        string det = carregado ? Fmt(v) + " / " + Fmt(lim) : "";
         int wd = Larg(g, det, fDet);
         TextRenderer.DrawText(g, det, fDet, new Point(pad + largura - wd, yn + (int)(24 * s)), TextoSuave, TextFormatFlags.NoPadding);
 
@@ -624,7 +840,7 @@ class Painel : Form
         int bh = (int)Math.Max(3, 4 * s), by = y + (int)(58 * s);
         var trilho = new RectangleF(pad, by, largura, bh);
         using (var p = Redondo(trilho, bh / 2f)) using (var b = new SolidBrush(Trilho)) g.FillPath(b, p);
-        if (carregado && pct > 0)
+        if (ok && pct > 0)
         {
             float w = Math.Max(bh, largura * pct / 100f);
             using (var p = Redondo(new RectangleF(pad, by, w, bh), bh / 2f)) using (var b = new SolidBrush(cor)) g.FillPath(b, p);
@@ -633,7 +849,8 @@ class Painel : Form
 
     void PintarSessoes(Graphics g, float s, int y, int pad, int largura, Font fMini, Font fSessao, Font fDet)
     {
-        TextoEspacado(g, "SESSÕES · ÚLTIMAS 5 HORAS", fMini, pad, y, TextoSuave, 1.2f * s);
+        var of = Fresco();
+        TextoEspacado(g, of != null ? "SESSÕES · JANELA DE 5 HORAS" : "SESSÕES · ÚLTIMAS 5 HORAS", fMini, pad, y, TextoSuave, 1.2f * s);
         y += (int)(24 * s);
         var lista = SessoesVisiveis();
         if (!carregado || lista.Count == 0)
@@ -655,7 +872,7 @@ class Painel : Form
                     string id = x.Chave.Substring(x.Chave.IndexOf('/') + 1);
                     nome += " · " + id.Substring(0, Math.Min(4, id.Length));
                 }
-                int pct = Pct(x.H5, lim5h);
+                int pct = PctSessao(x.H5);
                 bool ativa = (DateTime.UtcNow - x.Ultimo).TotalMinutes < 2;
 
                 int xt = pad;
@@ -690,9 +907,9 @@ class Painel : Form
         // rodapé: total geral
         int yr = y + (int)(6 * s);
         using (var pen = new Pen(Borda)) g.DrawLine(pen, pad, yr, pad + largura, yr);
-        int pt = carregado ? Pct(uso.H5, lim5h) : 0;
+        int pt = PctH5();
         TextRenderer.DrawText(g, "Total", fDet, new Point(pad, yr + (int)(10 * s)), TextoSuave, TextFormatFlags.NoPadding);
-        string tot = carregado ? Fmt(uso.H5) + " / " + Fmt(lim5h) + "  ·  " + pt + "%" : "";
+        string tot = carregado ? (of != null ? Fmt(uso.H5) : Fmt(uso.H5) + " / " + Fmt(lim5h)) + "  ·  " + pt + "%" : "";
         TextRenderer.DrawText(g, tot, fDet, new Point(pad + largura - Larg(g, tot, fDet), yr + (int)(10 * s)), Texto, TextFormatFlags.NoPadding);
     }
 
@@ -701,8 +918,17 @@ class Painel : Form
     // ---- Ícone da bandeja com a porcentagem ----
     void AtualizarIconeTray()
     {
-        int p5 = carregado ? Pct(uso.H5, lim5h) : 0, p7 = carregado ? Pct(uso.D7, lim7d) : 0;
-        string tip = carregado ? string.Format("Claude — 5h: {0}% ({1}) | 7d: {2}% ({3})", p5, Fmt(uso.H5), p7, Fmt(uso.D7)) : "Claude — carregando…";
+        var of = Fresco();
+        bool pronto = Pronto();
+        int p5 = PctH5(), p7 = PctD7();
+        string tip = "Claude — carregando…";
+        if (of != null)
+        {
+            string r5 = Reinicio(of.H5.Reinicia);
+            tip = string.Format("Claude — 5h: {0}%{1} | 7d: {2}%", p5, r5.Length > 0 ? " (reinicia " + r5 + ")" : "", p7);
+        }
+        else if (carregado)
+            tip = string.Format("Claude — 5h: {0}% ({1}) | 7d: {2}% ({3}) · estimado", p5, Fmt(uso.H5), p7, Fmt(uso.D7));
         tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
         int tam = Math.Max(16, SystemInformation.SmallIconSize.Width);
         using (var bmp = new Bitmap(tam, tam))
@@ -711,8 +937,8 @@ class Painel : Form
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             using (var p = Redondo(new RectangleF(0, 0, tam, tam), tam * 0.28f))
-            using (var b = new SolidBrush(carregado ? CorPct(p5) : Trilho)) g.FillPath(b, p);
-            string t = carregado ? (p5 >= 100 ? "!!" : p5.ToString()) : "…";
+            using (var b = new SolidBrush(pronto ? CorPct(p5) : Trilho)) g.FillPath(b, p);
+            string t = pronto ? (p5 >= 100 ? "!!" : p5.ToString()) : "…";
             float fs = t.Length >= 3 ? tam * 0.46f : t.Length == 2 ? tam * 0.62f : tam * 0.78f;
             using (var f = new Font("Segoe UI", fs, FontStyle.Bold, GraphicsUnit.Pixel))
             {
