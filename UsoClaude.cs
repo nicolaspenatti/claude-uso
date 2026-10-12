@@ -26,7 +26,9 @@ class Painel : Form
     bool carregado;
     bool porSessao;
     NotifyIcon tray;
-    System.Windows.Forms.Timer timer;
+    System.Windows.Forms.Timer timer, debounce;
+    FileSystemWatcher watcher;
+    bool calculando, pendente;
     DateTime ultimoFechar = DateTime.MinValue;
     IntPtr ultimoHandle = IntPtr.Zero;
 
@@ -77,9 +79,9 @@ class Painel : Form
         var menu = new ContextMenuStrip();
         menu.Items.Add("Atualizar agora", null, (s, e) => Atualizar());
         menu.Items.Add("Limites…", null, (s, e) => EditarLimites());
-        var intv = new ToolStripMenuItem("Atualizar a cada");
-        int atualSeg = (int)LerNum("Intervalo", 30);
-        foreach (int seg in new[] { 15, 30, 60, 300 })
+        var intv = new ToolStripMenuItem("Verificação periódica");
+        int atualSeg = IntervaloSeg();
+        foreach (int seg in new[] { 60, 120, 300 })
         {
             var it = new ToolStripMenuItem(seg < 60 ? seg + " segundos" : seg == 60 ? "1 minuto" : (seg / 60) + " minutos") { Checked = seg == atualSeg };
             int segVal = seg;
@@ -111,10 +113,55 @@ class Painel : Form
         };
         AtualizarIconeTray();
 
-        timer = new System.Windows.Forms.Timer { Interval = (int)Math.Max(5, LerNum("Intervalo", 30)) * 1000 };
-        timer.Tick += (s, e) => Atualizar();
+        // fallback lento: a janela de 5h e a sessão "ativa" mudam com o tempo, sem evento de arquivo
+        timer = new System.Windows.Forms.Timer { Interval = IntervaloSeg() * 1000 };
+        timer.Tick += (s, e) => { if (watcher == null) IniciarWatcher(); Atualizar(); };
         timer.Start();
+
+        debounce = new System.Windows.Forms.Timer { Interval = 1500 };
+        debounce.Tick += (s, e) => { debounce.Stop(); Atualizar(); };
+        IniciarWatcher();
         Atualizar();
+    }
+
+    static int IntervaloSeg() { return (int)Math.Max(60, LerNum("Intervalo", 120)); }
+
+    static string PastaProjetos()
+    {
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
+    }
+
+    void IniciarWatcher()
+    {
+        try
+        {
+            string raiz = PastaProjetos();
+            if (!Directory.Exists(raiz)) return;
+            var w = new FileSystemWatcher(raiz, "*.jsonl")
+            {
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName,
+                InternalBufferSize = 64 * 1024
+            };
+            FileSystemEventHandler h = (s, e) => AgendarAtualizacao();
+            w.Changed += h; w.Created += h; w.Deleted += h;
+            w.Renamed += (s, e) => AgendarAtualizacao();
+            w.Error += (s, e) => AgendarAtualizacao(); // buffer estourou: recálculo completo
+            w.EnableRaisingEvents = true;
+            watcher = w;
+        }
+        catch { watcher = null; }
+    }
+
+    // os eventos chegam em thread do pool; junta rajadas e volta para a thread da UI
+    void AgendarAtualizacao()
+    {
+        try
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke((Action)(() => { debounce.Stop(); debounce.Start(); }));
+        }
+        catch { }
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -127,6 +174,8 @@ class Painel : Form
     void Sair()
     {
         timer.Stop();
+        debounce.Stop();
+        if (watcher != null) { watcher.EnableRaisingEvents = false; watcher.Dispose(); watcher = null; }
         tray.Visible = false;
         tray.Dispose();
         if (ultimoHandle != IntPtr.Zero) DestroyIcon(ultimoHandle);
@@ -289,7 +338,7 @@ class Painel : Form
         var agora = DateTime.UtcNow;
         var corte7 = agora.AddDays(-7);
         var corte5 = agora.AddHours(-5);
-        string raiz = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
+        string raiz = PastaProjetos();
         if (!Directory.Exists(raiz)) return r;
         var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 1000 };
         var vistos = new HashSet<string>();
@@ -358,13 +407,20 @@ class Painel : Form
 
     void Atualizar()
     {
+        if (calculando) { pendente = true; return; }
+        calculando = true;
         Task.Run(() => Calcular()).ContinueWith(t =>
         {
-            if (t.IsFaulted || IsDisposed) return;
-            uso = t.Result; carregado = true; atualizadoEm = DateTime.Now;
-            if (Visible && porSessao) Reposicionar();
-            Invalidate();
-            AtualizarIconeTray();
+            calculando = false;
+            if (IsDisposed) return;
+            if (!t.IsFaulted)
+            {
+                uso = t.Result; carregado = true; atualizadoEm = DateTime.Now;
+                if (Visible && porSessao) Reposicionar();
+                Invalidate();
+                AtualizarIconeTray();
+            }
+            if (pendente) { pendente = false; Atualizar(); }
         }, TaskScheduler.FromCurrentSynchronizationContext());
     }
 

@@ -22,7 +22,7 @@
 |---|---|
 | Atualizar agora | Recalcula na hora |
 | Limites… | Define os limites de 5h e de 7 dias, em milhões de tokens |
-| Atualizar a cada | 15 s, 30 s, 1 min ou 5 min |
+| Verificação periódica | 1, 2 ou 5 min (a atualização principal é automática, por monitoramento de arquivos) |
 | Contabilizar por sessão | Mostra o consumo por sessão/projeto |
 | Iniciar com o Windows | Abre junto com o sistema |
 
@@ -34,7 +34,7 @@ Os valores padrão (5 milhões em 5h e 50 milhões em 7 dias) são **estimativas
 
 ## Como funciona
 
-O app lê os transcripts locais do Claude Code em `%USERPROFILE%\.claude\projects` e soma os tokens de cada resposta (entrada + saída + criação de cache), sem contar mensagens repetidas. Nada é enviado para a internet.
+O app lê os transcripts locais do Claude Code em `%USERPROFILE%\.claude\projects` e soma os tokens de cada resposta (entrada + saída + criação de cache), sem contar mensagens repetidas. Um `FileSystemWatcher` observa essa pasta e recalcula assim que o Claude Code escreve algo; uma verificação periódica mais lenta cobre o envelhecimento da janela de 5h. Nada é enviado para a internet.
 
 Limitações:
 
