@@ -6,6 +6,7 @@ using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -332,71 +333,145 @@ class Painel : Form
         }
     }
 
-    static Uso Calcular()
+    // ---- Cálculo incremental (roda só na thread de Atualizar, uma por vez) ----
+    class ArquivoCache { public long Offset; public string Chave; }
+    class Registro { public DateTime Quando; public long Tokens; public string Chave; }
+
+    readonly Dictionary<string, ArquivoCache> cacheArq = new Dictionary<string, ArquivoCache>();
+    readonly List<Registro> registros = new List<Registro>();
+    readonly Dictionary<string, DateTime> vistos = new Dictionary<string, DateTime>();
+    readonly Dictionary<string, string> nomes = new Dictionary<string, string>();
+    readonly JavaScriptSerializer ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 1000 };
+
+    void ZerarCache()
+    {
+        cacheArq.Clear(); registros.Clear(); vistos.Clear(); nomes.Clear();
+    }
+
+    Uso Calcular()
     {
         var r = new Uso();
         var agora = DateTime.UtcNow;
         var corte7 = agora.AddDays(-7);
         var corte5 = agora.AddHours(-5);
         string raiz = PastaProjetos();
-        if (!Directory.Exists(raiz)) return r;
-        var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 1000 };
-        var vistos = new HashSet<string>();
-        var mapa = new Dictionary<string, Sessao>();
+        if (!Directory.Exists(raiz)) { ZerarCache(); return r; }
+
+        var ultimos = new Dictionary<string, DateTime>(); // sessão -> última escrita
+        var presentes = new HashSet<string>();
         foreach (var arq in Directory.EnumerateFiles(raiz, "*.jsonl", SearchOption.AllDirectories))
         {
             try
             {
                 var escrito = File.GetLastWriteTimeUtc(arq);
                 if (escrito < corte7) continue;
-                // sessão = projeto + id (subagentes ficam em subpastas e entram na sessão-mãe)
-                var partes = arq.Substring(raiz.Length).Trim('\\', '/').Split('\\', '/');
-                string chave = partes[0] + "/" + (partes.Length > 1 ? Path.GetFileNameWithoutExtension(partes[1]) : "");
-                Sessao sess;
-                if (!mapa.TryGetValue(chave, out sess))
+                presentes.Add(arq);
+                ArquivoCache c;
+                if (!cacheArq.TryGetValue(arq, out c))
                 {
-                    sess = new Sessao { Chave = chave, Projeto = partes[0] };
-                    mapa[chave] = sess;
-                    r.Sessoes.Add(sess);
+                    // sessão = projeto + id (subagentes ficam em subpastas e entram na sessão-mãe)
+                    var partes = arq.Substring(raiz.Length).Trim('\\', '/').Split('\\', '/');
+                    c = new ArquivoCache { Chave = partes[0] + "/" + (partes.Length > 1 ? Path.GetFileNameWithoutExtension(partes[1]) : "") };
+                    cacheArq[arq] = c;
                 }
-                if (escrito > sess.Ultimo) sess.Ultimo = escrito;
-                using (var fs = new FileStream(arq, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var sr = new StreamReader(fs))
-                {
-                    string linha;
-                    while ((linha = sr.ReadLine()) != null)
-                    {
-                        if (linha.IndexOf("\"usage\"", StringComparison.Ordinal) < 0) continue;
-                        try
-                        {
-                            var o = ser.DeserializeObject(linha) as Dictionary<string, object>;
-                            if (o == null || !o.ContainsKey("timestamp")) continue;
-                            object cwd;
-                            if (!sess.Nomeado && o.TryGetValue("cwd", out cwd) && cwd != null)
-                            {
-                                string nome = Path.GetFileName(cwd.ToString().TrimEnd('\\', '/'));
-                                if (!string.IsNullOrEmpty(nome)) { sess.Projeto = nome; sess.Nomeado = true; }
-                            }
-                            var msg = o["message"] as Dictionary<string, object>;
-                            if (msg == null) continue;
-                            var u = msg["usage"] as Dictionary<string, object>;
-                            if (u == null) continue;
-                            object id;
-                            if (msg.TryGetValue("id", out id) && id != null && !vistos.Add(id.ToString())) continue;
-                            var quando = DateTime.Parse(o["timestamp"].ToString(), CultureInfo.InvariantCulture,
-                                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
-                            if (quando < corte7) continue;
-                            long n = Val(u, "input_tokens") + Val(u, "output_tokens") + Val(u, "cache_creation_input_tokens");
-                            r.D7 += n; sess.D7 += n;
-                            if (quando >= corte5) { r.H5 += n; sess.H5 += n; }
-                        }
-                        catch { }
-                    }
-                }
+                DateTime u;
+                if (!ultimos.TryGetValue(c.Chave, out u) || escrito > u) ultimos[c.Chave] = escrito;
+                if (!LerNovo(arq, c, corte7)) { ZerarCache(); return Calcular(); } // arquivo truncado: recomeça do zero
             }
             catch { }
         }
+
+        // esquece arquivos que sumiram ou saíram da janela
+        var fora = new List<string>();
+        foreach (var k in cacheArq.Keys) if (!presentes.Contains(k)) fora.Add(k);
+        foreach (var k in fora) cacheArq.Remove(k);
+        registros.RemoveAll(x => x.Quando < corte7);
+        var velhos = new List<string>();
+        foreach (var kv in vistos) if (kv.Value < corte7) velhos.Add(kv.Key);
+        foreach (var k in velhos) vistos.Remove(k);
+
+        var mapa = new Dictionary<string, Sessao>();
+        foreach (var kv in ultimos)
+        {
+            string nome;
+            bool nomeado = nomes.TryGetValue(kv.Key, out nome);
+            var s = new Sessao { Chave = kv.Key, Ultimo = kv.Value, Nomeado = nomeado, Projeto = nomeado ? nome : kv.Key.Substring(0, kv.Key.IndexOf('/')) };
+            mapa[kv.Key] = s;
+            r.Sessoes.Add(s);
+        }
+        foreach (var x in registros)
+        {
+            Sessao sess;
+            if (!mapa.TryGetValue(x.Chave, out sess)) continue;
+            r.D7 += x.Tokens; sess.D7 += x.Tokens;
+            if (x.Quando >= corte5) { r.H5 += x.Tokens; sess.H5 += x.Tokens; }
+        }
         return r;
+    }
+
+    // lê só as linhas completas anexadas desde a última passada
+    bool LerNovo(string arq, ArquivoCache c, DateTime corte7)
+    {
+        using (var fs = new FileStream(arq, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            if (fs.Length < c.Offset) return false; // truncado ou reescrito
+            if (fs.Length == c.Offset) return true;
+            fs.Seek(c.Offset, SeekOrigin.Begin);
+            var buf = new byte[81920];
+            var acc = new MemoryStream();
+            long pos = c.Offset;
+            int n;
+            while ((n = fs.Read(buf, 0, buf.Length)) > 0)
+            {
+                int ini = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    if (buf[i] != 10) continue;
+                    acc.Write(buf, ini, i - ini);
+                    ProcessarLinha(Encoding.UTF8.GetString(acc.GetBuffer(), 0, (int)acc.Length), c, corte7);
+                    pos += acc.Length + 1;
+                    c.Offset = pos;
+                    acc.SetLength(0);
+                    ini = i + 1;
+                }
+                acc.Write(buf, ini, n - ini);
+            }
+            // o resto (linha ainda sem \n) fica para a próxima passada
+        }
+        return true;
+    }
+
+    void ProcessarLinha(string linha, ArquivoCache c, DateTime corte7)
+    {
+        if (linha.IndexOf("\"usage\"", StringComparison.Ordinal) < 0) return;
+        try
+        {
+            var o = ser.DeserializeObject(linha) as Dictionary<string, object>;
+            if (o == null || !o.ContainsKey("timestamp")) return;
+            object cwd;
+            if (!nomes.ContainsKey(c.Chave) && o.TryGetValue("cwd", out cwd) && cwd != null)
+            {
+                string nome = Path.GetFileName(cwd.ToString().TrimEnd('\\', '/'));
+                if (!string.IsNullOrEmpty(nome)) nomes[c.Chave] = nome;
+            }
+            var msg = o["message"] as Dictionary<string, object>;
+            if (msg == null) return;
+            var u = msg["usage"] as Dictionary<string, object>;
+            if (u == null) return;
+            var quando = DateTime.Parse(o["timestamp"].ToString(), CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+            object id;
+            if (msg.TryGetValue("id", out id) && id != null)
+            {
+                string sid = id.ToString();
+                if (vistos.ContainsKey(sid)) return;
+                vistos[sid] = quando;
+            }
+            if (quando < corte7) return;
+            long n = Val(u, "input_tokens") + Val(u, "output_tokens") + Val(u, "cache_creation_input_tokens");
+            registros.Add(new Registro { Quando = quando, Tokens = n, Chave = c.Chave });
+        }
+        catch { }
     }
 
     static long Val(Dictionary<string, object> d, string k)
